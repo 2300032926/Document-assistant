@@ -1,3 +1,22 @@
+"""
+HR Document Assistant
+======================
+
+A multilingual RAG (Retrieval-Augmented Generation) chatbot for company
+HR documents. Employees register/log in, ask questions about HR policy
+PDFs in English, Telugu, Hindi, or Tamil, and receive answers grounded
+in the actual documents — complete with source citations, a confidence
+score, and optional voice output.
+
+Pipeline: PDFs -> chunked -> embedded (HuggingFace) -> indexed (FAISS)
+          -> top-k chunks retrieved per question -> passed as context
+          to Gemini 2.5 Flash -> answer + sources + confidence saved
+          to a per-user chat history in SQLite.
+
+See README.md for architecture details, setup instructions, and the
+full feature list.
+"""
+
 import streamlit as st
 import sqlite3
 import hashlib
@@ -158,6 +177,12 @@ button[kind="header"] { display:flex !important; visibility:visible !important; 
 # DATABASE
 # ==========================================================
 def init_db():
+    """Create the SQLite connection and ensure tables exist.
+
+    Also runs a lightweight migration that adds the `sources` and
+    `confidence` columns to chat_history if this is an older database
+    created before those columns existed.
+    """
     conn = sqlite3.connect("users.db", check_same_thread=False)
     cur = conn.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -183,9 +208,13 @@ def init_db():
     conn.commit()
     return conn
 
-def hp(p): return hashlib.sha256(p.encode()).hexdigest()
+def hp(p):
+    """Hash a plaintext password with SHA-256 before storing/comparing it."""
+    return hashlib.sha256(p.encode()).hexdigest()
 
 def register_user(conn, u, e, p):
+    """Insert a new user. Returns (success, message) — fails if the
+    username or email is already taken (enforced by UNIQUE constraints)."""
     try:
         conn.cursor().execute("INSERT INTO users(username,email,password) VALUES(?,?,?)",(u,e,hp(p)))
         conn.commit(); return True,"ok"
@@ -193,15 +222,22 @@ def register_user(conn, u, e, p):
         return False,("Username already exists." if "username" in str(ex) else "Email already registered.")
 
 def login_user(conn, u, p):
+    """Look up a user by username + hashed password. Returns the row if
+    credentials match, otherwise None."""
     c=conn.cursor(); c.execute("SELECT * FROM users WHERE username=? AND password=?",(u,hp(p))); return c.fetchone()
 
 def save_chat(conn, username, question, answer, language, sources, confidence):
+    """Persist one Q&A turn, scoped to the asking user, so it survives
+    logout and is never visible to other users."""
     conn.cursor().execute(
         "INSERT INTO chat_history(username,question,answer,language,sources,confidence) VALUES(?,?,?,?,?,?)",
         (username, question, answer, language, sources, confidence))
     conn.commit()
 
 def get_chat_history(conn, username, limit=5):
+    """Return the most recent chat turns for a single user only.
+    The WHERE username=? clause is what keeps users' histories private
+    from each other."""
     cur = conn.cursor()
     cur.execute(
         "SELECT question,answer,language,sources,confidence,created_at FROM chat_history WHERE username=? ORDER BY id DESC LIMIT ?",
@@ -209,6 +245,7 @@ def get_chat_history(conn, username, limit=5):
     return cur.fetchall()
 
 def get_all_chat_history(conn, username):
+    """Full chat history for one user — used for the CSV export feature."""
     cur = conn.cursor()
     cur.execute(
         "SELECT question,answer,language,sources,confidence,created_at FROM chat_history WHERE username=? ORDER BY id DESC",
@@ -216,6 +253,8 @@ def get_all_chat_history(conn, username):
     return cur.fetchall()
 
 def get_today_question_count(conn, username):
+    """Count how many questions this user has asked today — backs the
+    daily rate limit shown in the sidebar usage bar."""
     cur = conn.cursor()
     cur.execute(
         "SELECT COUNT(*) FROM chat_history WHERE username=? AND date(created_at)=date('now')",
@@ -223,6 +262,8 @@ def get_today_question_count(conn, username):
     return cur.fetchone()[0]
 
 def get_admin_stats(conn):
+    """Aggregate usage stats across ALL users — only ever shown to the
+    'admin' account in the admin dashboard, never to regular users."""
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     total_users = cur.fetchone()[0]
@@ -252,6 +293,11 @@ conn = init_db()
 # AUTH PAGE
 # ==========================================================
 def show_auth():
+    """Render the login/register screen shown to logged-out users.
+
+    Handles three states: the post-registration success screen, the
+    Sign In tab, and the Register tab.
+    """
     _, col, _ = st.columns([1, 1.6, 1])
     with col:
 
@@ -331,6 +377,13 @@ def show_auth():
 # ==========================================================
 @st.cache_resource(show_spinner=False)
 def load_rag(pdf_paths_tuple):
+    """Build the RAG pipeline: load PDFs, split into chunks, embed them
+    with HuggingFace, and index them in FAISS for similarity search.
+
+    Cached by Streamlit so this expensive step only reruns when the set
+    of PDF paths changes (e.g. after an upload or delete), not on every
+    interaction.
+    """
     pdf_paths = list(pdf_paths_tuple)
     docs = []
     for pdf in pdf_paths:
@@ -351,6 +404,8 @@ def load_rag(pdf_paths_tuple):
 
 
 def get_all_pdf_paths():
+    """Combine the default HR PDFs shipped with the repo and any PDFs
+    a user has uploaded at runtime into a single list to index."""
     paths = []
     for f in ["Employee-Handbook.pdf", "Leave_Policy.pdf", "HR_Policy.pdf", "Recruitment Policy.pdf"]:
         if os.path.exists(f):
@@ -363,6 +418,8 @@ def get_all_pdf_paths():
 
 
 def delete_uploaded_pdf(filename):
+    """Remove a user-uploaded PDF from disk. Default/repo PDFs are not
+    deletable through this function — only files in uploaded_pdfs/."""
     path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(path):
         os.remove(path)
@@ -374,6 +431,11 @@ def delete_uploaded_pdf(filename):
 # MAIN APP
 # ==========================================================
 def show_app():
+    """Render the logged-in experience: sidebar (profile, usage,
+    documents, tech stack info, export), the admin dashboard (if the
+    user is 'admin'), and the main question/answer panel with source
+    citations, confidence score, voice output, and chat history.
+    """
 
     is_admin = st.session_state.username.lower() == "admin"
 
