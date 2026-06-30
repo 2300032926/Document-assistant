@@ -375,6 +375,24 @@ def show_auth():
 # ==========================================================
 # RAG LOADING
 # ==========================================================
+FAISS_INDEX_DIR = "faiss_index"
+
+@st.cache_resource(show_spinner=False)
+def get_embedding_model():
+    """Load the HuggingFace embedding model once and cache it for the
+    lifetime of the app. This is the slowest one-time cost (model
+    download/load) — separating it from load_rag() means re-indexing
+    after a PDF upload doesn't pay this cost again."""
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+
+@st.cache_resource(show_spinner=False)
+def get_llm():
+    """Cache the Gemini client separately too — no reason to recreate
+    it every time the document set changes."""
+    return ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+
 @st.cache_resource(show_spinner=False)
 def load_rag(pdf_paths_tuple):
     """Build the RAG pipeline: load PDFs, split into chunks, embed them
@@ -382,7 +400,9 @@ def load_rag(pdf_paths_tuple):
 
     Cached by Streamlit so this expensive step only reruns when the set
     of PDF paths changes (e.g. after an upload or delete), not on every
-    interaction.
+    interaction. The embedding model itself is cached separately via
+    get_embedding_model(), so only the document chunking + FAISS build
+    happens again here — not the model load.
     """
     pdf_paths = list(pdf_paths_tuple)
     docs = []
@@ -397,9 +417,9 @@ def load_rag(pdf_paths_tuple):
     if not docs:
         return None, None, 0, 0
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
-    emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    emb = get_embedding_model()
     db  = FAISS.from_documents(chunks, emb)
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = get_llm()
     return db, llm, len(docs), len(chunks)
 
 
@@ -476,7 +496,7 @@ def show_app():
                     if is_user_uploaded:
                         if st.button("🗑️", key=f"del_{name}", help=f"Delete {name}"):
                             delete_uploaded_pdf(name)
-                            st.cache_resource.clear()
+                            load_rag.clear()
                             st.rerun()
         else:
             st.markdown("<div class='sb-badge'>⚠️ No PDFs found</div>", unsafe_allow_html=True)
@@ -485,12 +505,13 @@ def show_app():
         st.markdown("**📤 Upload More PDFs**")
         uploaded = st.file_uploader("Add HR documents", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
         if uploaded:
-            for file in uploaded:
-                save_path = os.path.join(UPLOAD_DIR, file.name)
-                with open(save_path, "wb") as f:
-                    f.write(file.getbuffer())
-            st.success(f"✅ {len(uploaded)} file(s) uploaded!")
-            st.cache_resource.clear()
+            with st.spinner(f"Saving {len(uploaded)} file(s) and re-indexing..."):
+                for file in uploaded:
+                    save_path = os.path.join(UPLOAD_DIR, file.name)
+                    with open(save_path, "wb") as f:
+                        f.write(file.getbuffer())
+                load_rag.clear()
+            st.success(f"✅ {len(uploaded)} file(s) uploaded and indexed!")
             st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
@@ -580,7 +601,7 @@ def show_app():
     except Exception as e:
         st.error(f"⚠️ Failed to load documents: {e}")
         if st.button("🔄 Retry"):
-            st.cache_resource.clear()
+            load_rag.clear()
             st.rerun()
         return
 
