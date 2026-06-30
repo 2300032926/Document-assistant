@@ -609,119 +609,130 @@ def show_app():
         st.error("Could not load any documents. They may be corrupted — try re-uploading.")
         return
 
-    c1,c2,c3 = st.columns(3)
-    for col,val,lbl in [(c1,n_pages,"Pages Indexed"),(c2,n_chunks,"Knowledge Chunks"),(c3,4,"Languages")]:
-        with col:
-            st.markdown(f"<div class='stat-card'><div class='stat-val'>{val}</div><div class='stat-lbl'>{lbl}</div></div>",unsafe_allow_html=True)
+    # ---------- TABS: keeps Chat, History, and Stats visually separate ----------
+    tab_chat, tab_history, tab_stats = st.tabs(["💬  Chat", "📜  History", "📊  Stats & Documents"])
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # ============== TAB 1: CHAT ==============
+    with tab_chat:
+        today_count = get_today_question_count(conn, st.session_state.username)
+        limit_reached = today_count >= DAILY_QUESTION_LIMIT
 
-    # ---------- RATE LIMIT CHECK ----------
-    today_count = get_today_question_count(conn, st.session_state.username)
-    limit_reached = today_count >= DAILY_QUESTION_LIMIT
+        cl,cq = st.columns([1,3])
+        with cl: language = st.selectbox("🌐 Language",["English","Telugu","Hindi","Tamil"])
+        with cq: question = st.text_input("💬 Your Question", placeholder="e.g. How many leave days per year?", disabled=limit_reached)
 
-    cl,cq = st.columns([1,3])
-    with cl: language = st.selectbox("🌐 Language",["English","Telugu","Hindi","Tamil"])
-    with cq: question = st.text_input("💬 Your Question", placeholder="e.g. How many leave days per year?", disabled=limit_reached)
+        if limit_reached:
+            st.warning(f"⚠️ You've reached your daily limit of {DAILY_QUESTION_LIMIT} questions. Please try again tomorrow.")
 
-    if limit_reached:
-        st.warning(f"⚠️ You've reached your daily limit of {DAILY_QUESTION_LIMIT} questions. Please try again tomorrow.")
+        ask_clicked = st.button("🔍 Ask HR Assistant", disabled=limit_reached)
 
-    ask_clicked = st.button("🔍 Ask HR Assistant", disabled=limit_reached)
+        if ask_clicked:
+            if question.strip():
+                try:
+                    results_with_scores = db.similarity_search_with_relevance_scores(question, k=3)
+                except Exception:
+                    results_with_scores = [(d, 0.0) for d in db.similarity_search(question, k=3)]
 
-    if ask_clicked:
-        if question.strip():
-            try:
-                results_with_scores = db.similarity_search_with_relevance_scores(question, k=3)
-            except Exception:
-                results_with_scores = [(d, 0.0) for d in db.similarity_search(question, k=3)]
+                docs_found = [r[0] for r in results_with_scores]
+                scores = [max(0.0, min(1.0, r[1])) for r in results_with_scores]
+                avg_confidence = round((sum(scores)/len(scores))*100, 1) if scores else 0.0
 
-            docs_found = [r[0] for r in results_with_scores]
-            scores = [max(0.0, min(1.0, r[1])) for r in results_with_scores]
-            avg_confidence = round((sum(scores)/len(scores))*100, 1) if scores else 0.0
+                ctx = "\n".join([d.page_content for d in docs_found])
+                source_files = sorted(set(d.metadata.get("source_file", "Unknown") for d in docs_found))
+                source_pages = sorted(set(
+                    f"{d.metadata.get('source_file','Unknown')} (p.{d.metadata.get('page', '?')+1 if isinstance(d.metadata.get('page'), int) else '?'})"
+                    for d in docs_found
+                ))
 
-            ctx = "\n".join([d.page_content for d in docs_found])
-            source_files = sorted(set(d.metadata.get("source_file", "Unknown") for d in docs_found))
-            source_pages = sorted(set(
-                f"{d.metadata.get('source_file','Unknown')} (p.{d.metadata.get('page', '?')+1 if isinstance(d.metadata.get('page'), int) else '?'})"
-                for d in docs_found
-            ))
-
-            prompt = f"""You are a professional HR assistant.
+                prompt = f"""You are a professional HR assistant.
 Answer ONLY from the context. If not found say: "This information is not available in the HR documents."
 Be clear and concise. Respond in {language} language.
 Context:\n{ctx}\nQuestion: {question}"""
 
-            with st.spinner("Searching HR documents..."):
-                answer = llm.invoke(prompt).content
+                with st.spinner("Searching HR documents..."):
+                    answer = llm.invoke(prompt).content
 
-            sources_str = ", ".join(source_pages)
-            save_chat(conn, st.session_state.username, question, answer, language, sources_str, avg_confidence)
+                sources_str = ", ".join(source_pages)
+                save_chat(conn, st.session_state.username, question, answer, language, sources_str, avg_confidence)
 
-            # Streaming-style display
-            placeholder = st.empty()
-            displayed = ""
-            words = answer.split(" ")
-            chunk_size = max(1, len(words)//40) if len(words) > 40 else 1
-            for i in range(0, len(words), chunk_size):
-                displayed += " ".join(words[i:i+chunk_size]) + " "
-                placeholder.markdown(f"""<div class='answer-box'><div class='answer-lbl'>Answer · {language}</div>{displayed}▌</div>""", unsafe_allow_html=True)
-                time.sleep(0.02)
-            placeholder.markdown(f"""<div class='answer-box'><div class='answer-lbl'>Answer · {language}</div>{answer}</div>""", unsafe_allow_html=True)
+                # Streaming-style display
+                placeholder = st.empty()
+                displayed = ""
+                words = answer.split(" ")
+                chunk_size = max(1, len(words)//40) if len(words) > 40 else 1
+                for i in range(0, len(words), chunk_size):
+                    displayed += " ".join(words[i:i+chunk_size]) + " "
+                    placeholder.markdown(f"""<div class='answer-box'><div class='answer-lbl'>Answer · {language}</div>{displayed}▌</div>""", unsafe_allow_html=True)
+                    time.sleep(0.02)
+                placeholder.markdown(f"""<div class='answer-box'><div class='answer-lbl'>Answer · {language}</div>{answer}</div>""", unsafe_allow_html=True)
 
-            # Confidence bar
-            try:
-                avg_confidence = float(avg_confidence)
-            except (TypeError, ValueError):
-                avg_confidence = 0.0
-            conf_color = "#16a34a" if avg_confidence >= 70 else ("#f59e0b" if avg_confidence >= 40 else "#dc2626")
-            st.markdown(f"""
-            <div class='confidence-wrap'>
-                <span class='confidence-text'>Match Confidence:</span>
-                <div class='confidence-bar-bg'><div class='confidence-bar-fill' style='width:{avg_confidence}%; background:{conf_color};'></div></div>
-                <span class='confidence-text'>{avg_confidence}%</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            # Source citations
-            if source_files:
-                chips = "".join([f"<span class='source-chip'>📄 {s}</span>" for s in source_files])
-                st.markdown(f"<div style='margin-top:10px;'>{chips}</div>", unsafe_allow_html=True)
-
-            # Voice
-            try:
-                lmap={"English":"en","Telugu":"te","Hindi":"hi","Tamil":"ta"}
-                tts=gTTS(text=answer,lang=lmap[language],slow=False); tts.save("answer.mp3")
-                st.markdown("<br>**🔊 Listen to Answer**")
-                with open("answer.mp3","rb") as f: st.audio(f.read(),format="audio/mp3")
-            except Exception as e:
-                st.warning(f"Voice unavailable: {e}")
-        else:
-            st.warning("Please enter a question.")
-
-    # ---------- CHAT HISTORY ----------
-    history = get_chat_history(conn, st.session_state.username, limit=5)
-    if history:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>📜 Your Recent Questions</div>", unsafe_allow_html=True)
-        for q, a, lang, src, conf, created in history:
-            with st.expander(f"Q: {q[:65]}  [{lang}]"):
-                st.markdown(f"""<div class='answer-box'><div class='answer-lbl'>{lang}</div>{a}</div>""",unsafe_allow_html=True)
+                # Confidence bar
                 try:
-                    conf = float(conf) if conf is not None else None
+                    avg_confidence = float(avg_confidence)
                 except (TypeError, ValueError):
-                    conf = None
-                if conf is not None:
-                    conf_color = "#16a34a" if conf >= 70 else ("#f59e0b" if conf >= 40 else "#dc2626")
-                    st.markdown(f"""
-                    <div class='confidence-wrap'>
-                        <span class='confidence-text'>Confidence:</span>
-                        <div class='confidence-bar-bg'><div class='confidence-bar-fill' style='width:{conf}%; background:{conf_color};'></div></div>
-                        <span class='confidence-text'>{conf}%</span>
-                    </div>""", unsafe_allow_html=True)
-                if src:
-                    chips = "".join([f"<span class='source-chip'>📄 {s}</span>" for s in src.split(", ")])
-                    st.markdown(f"<div style='margin-top:8px;'>{chips}</div>", unsafe_allow_html=True)
+                    avg_confidence = 0.0
+                conf_color = "#16a34a" if avg_confidence >= 70 else ("#f59e0b" if avg_confidence >= 40 else "#dc2626")
+                st.markdown(f"""
+                <div class='confidence-wrap'>
+                    <span class='confidence-text'>Match Confidence:</span>
+                    <div class='confidence-bar-bg'><div class='confidence-bar-fill' style='width:{avg_confidence}%; background:{conf_color};'></div></div>
+                    <span class='confidence-text'>{avg_confidence}%</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Source citations
+                if source_files:
+                    chips = "".join([f"<span class='source-chip'>📄 {s}</span>" for s in source_files])
+                    st.markdown(f"<div style='margin-top:10px;'>{chips}</div>", unsafe_allow_html=True)
+
+                # Voice
+                try:
+                    lmap={"English":"en","Telugu":"te","Hindi":"hi","Tamil":"ta"}
+                    tts=gTTS(text=answer,lang=lmap[language],slow=False); tts.save("answer.mp3")
+                    st.markdown("<br>**🔊 Listen to Answer**")
+                    with open("answer.mp3","rb") as f: st.audio(f.read(),format="audio/mp3")
+                except Exception as e:
+                    st.warning(f"Voice unavailable: {e}")
+            else:
+                st.warning("Please enter a question.")
+
+    # ============== TAB 2: HISTORY ==============
+    with tab_history:
+        history = get_chat_history(conn, st.session_state.username, limit=20)
+        if history:
+            st.markdown("<div class='section-title'>📜 Your Recent Questions</div>", unsafe_allow_html=True)
+            for q, a, lang, src, conf, created in history:
+                with st.expander(f"Q: {q[:65]}  [{lang}]"):
+                    st.markdown(f"""<div class='answer-box'><div class='answer-lbl'>{lang}</div>{a}</div>""",unsafe_allow_html=True)
+                    try:
+                        conf = float(conf) if conf is not None else None
+                    except (TypeError, ValueError):
+                        conf = None
+                    if conf is not None:
+                        conf_color = "#16a34a" if conf >= 70 else ("#f59e0b" if conf >= 40 else "#dc2626")
+                        st.markdown(f"""
+                        <div class='confidence-wrap'>
+                            <span class='confidence-text'>Confidence:</span>
+                            <div class='confidence-bar-bg'><div class='confidence-bar-fill' style='width:{conf}%; background:{conf_color};'></div></div>
+                            <span class='confidence-text'>{conf}%</span>
+                        </div>""", unsafe_allow_html=True)
+                    if src:
+                        chips = "".join([f"<span class='source-chip'>📄 {s}</span>" for s in src.split(", ")])
+                        st.markdown(f"<div style='margin-top:8px;'>{chips}</div>", unsafe_allow_html=True)
+        else:
+            st.caption("No questions asked yet — head to the Chat tab to get started.")
+
+    # ============== TAB 3: STATS & DOCUMENTS ==============
+    with tab_stats:
+        c1,c2,c3 = st.columns(3)
+        for col,val,lbl in [(c1,n_pages,"Pages Indexed"),(c2,n_chunks,"Knowledge Chunks"),(c3,4,"Languages")]:
+            with col:
+                st.markdown(f"<div class='stat-card'><div class='stat-val'>{val}</div><div class='stat-lbl'>{lbl}</div></div>",unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<div class='section-title'>📂 Indexed documents</div>", unsafe_allow_html=True)
+        for p in pdf_paths:
+            st.markdown(f"<div class='sb-badge' style='color:#1e50c8 !important; background:#eef2ff !important; border-color:#c7d2fe !important;'>📄 {os.path.basename(p)}</div>", unsafe_allow_html=True)
 
 
 # ==========================================================
