@@ -196,6 +196,11 @@ def init_db():
         answer TEXT,
         language TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS documents(
+        filename TEXT PRIMARY KEY,
+        uploaded_by TEXT,
+        uploader_email TEXT,
+        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
 
     # Migration: add new columns if this is an older database
     cur.execute("PRAGMA table_info(chat_history)")
@@ -437,14 +442,92 @@ def get_all_pdf_paths():
     return paths
 
 
-def delete_uploaded_pdf(filename):
-    """Remove a user-uploaded PDF from disk. Default/repo PDFs are not
-    deletable through this function — only files in uploaded_pdfs/."""
-    path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(path):
-        os.remove(path)
+def record_pdf_owner(conn, filename, uploaded_by, uploader_email):
+    """Record who uploaded a PDF, so we know who to notify if someone
+    else later deletes it."""
+    conn.cursor().execute(
+        "INSERT OR REPLACE INTO documents(filename, uploaded_by, uploader_email) VALUES (?,?,?)",
+        (filename, uploaded_by, uploader_email))
+    conn.commit()
+
+
+def get_pdf_owner(conn, filename):
+    """Look up who originally uploaded a given PDF. Returns
+    (uploaded_by, uploader_email) or (None, None) if unknown."""
+    cur = conn.cursor()
+    cur.execute("SELECT uploaded_by, uploader_email FROM documents WHERE filename=?", (filename,))
+    row = cur.fetchone()
+    return row if row else (None, None)
+
+
+def send_deletion_email(to_email, to_username, deleted_by, filename):
+    """Notify a user by email that someone else deleted their uploaded PDF.
+
+    Reads SMTP credentials from Streamlit secrets (EMAIL_ADDRESS,
+    EMAIL_APP_PASSWORD). If they're not configured, this silently does
+    nothing rather than crashing the app — email is a nice-to-have, not
+    a blocker for the core feature.
+    """
+    try:
+        sender_email = st.secrets["EMAIL_ADDRESS"]
+        sender_password = st.secrets["EMAIL_APP_PASSWORD"]
+    except Exception as e:
+        st.warning(f"DEBUG: email secrets not found — {e}")
+        return False
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    subject = "Your HR Assistant document was deleted"
+    body = f"""Hi {to_username},
+
+This is a notification from HR Document Assistant.
+
+Your uploaded file "{filename}" was deleted by user "{deleted_by}".
+
+If you did not expect this, please contact your HR Assistant administrator.
+
+— HR Document Assistant
+"""
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, to_email, msg.as_string())
+        st.success("DEBUG: email sent successfully")
         return True
-    return False
+    except Exception as e:
+        st.error(f"DEBUG: email send failed — {e}")
+        return False
+
+
+def delete_uploaded_pdf(filename, conn=None, deleted_by=None):
+    """Remove a user-uploaded PDF from disk. Default/repo PDFs are not
+    deletable through this function — only files in uploaded_pdfs/.
+
+    If conn and deleted_by are provided, this also looks up the
+    original uploader and emails them if someone else performed the
+    deletion.
+    """
+    path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(path):
+        return False
+
+    if conn is not None and deleted_by is not None:
+        owner_username, owner_email = get_pdf_owner(conn, filename)
+        st.info(f"DEBUG: owner_username={owner_username!r}, owner_email={owner_email!r}, deleted_by={deleted_by!r}")
+        if owner_username and owner_email and owner_username != deleted_by:
+            send_deletion_email(owner_email, owner_username, deleted_by, filename)
+        conn.cursor().execute("DELETE FROM documents WHERE filename=?", (filename,))
+        conn.commit()
+
+    os.remove(path)
+    return True
 
 
 # ==========================================================
@@ -495,7 +578,9 @@ def show_app():
                 with col_b:
                     if is_user_uploaded:
                         if st.button("🗑️", key=f"del_{name}", help=f"Delete {name}"):
-                            delete_uploaded_pdf(name)
+                            deleted = delete_uploaded_pdf(name, conn=conn, deleted_by=st.session_state.username)
+                            if deleted:
+                                st.toast(f"Deleted {name}", icon="🗑️")
                             load_rag.clear()
                             st.rerun()
         else:
@@ -510,6 +595,13 @@ def show_app():
                     save_path = os.path.join(UPLOAD_DIR, file.name)
                     with open(save_path, "wb") as f:
                         f.write(file.getbuffer())
+                    # Record ownership so we can notify this user later if
+                    # someone else deletes this file
+                    cur = conn.cursor()
+                    cur.execute("SELECT email FROM users WHERE username=?", (st.session_state.username,))
+                    row = cur.fetchone()
+                    uploader_email = row[0] if row else None
+                    record_pdf_owner(conn, file.name, st.session_state.username, uploader_email)
                 load_rag.clear()
             st.success(f"✅ {len(uploaded)} file(s) uploaded and indexed!")
             st.rerun()
