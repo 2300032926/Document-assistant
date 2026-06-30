@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+answer.mp3
+*.db-journal
+users.db
+app_backup.py
+database.py
